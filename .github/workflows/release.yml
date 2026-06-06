@@ -23,8 +23,12 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
+          # Cross-compiled on the arm64 runner — macos-13 (the last hosted
+          # Intel runner) has very long queue times and is being phased out.
+          # Apple Silicon's system toolchain cross-builds x86_64-apple-darwin
+          # natively, no extra setup needed beyond `rustup target add`.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
