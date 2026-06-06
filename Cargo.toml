@@ -1,0 +1,40 @@
+[package]
+name = "rspassimpt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rspassimpt"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_passwd"
+path = "src/bin/gen_passwd.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+indicatif = "0.17"
+rayon = "1"
+anyhow = "1"
+thiserror = "2"
+zeroize = { version = "1", features = ["alloc", "derive"] }
+tempfile = "3"
+dirs = "6"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parse"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

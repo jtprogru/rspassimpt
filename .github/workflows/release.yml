@@ -1,0 +1,232 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Cross-target build matrix. Each job produces a .tar.gz + .sha256.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Sanity: the tag must match Cargo.toml's version so the release artifacts
+      # and the Homebrew formula don't drift apart.
+      - name: verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }} --bin rspassimpt
+
+      - name: smoke (--version)
+        if: matrix.runner != 'ubuntu-24.04-arm' || matrix.target != 'aarch64-unknown-linux-gnu' || runner.arch == 'ARM64'
+        run: ./target/${{ matrix.target }}/release/rspassimpt --version
+
+      - name: strip + archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          tag="${GITHUB_REF_NAME}"
+          archive="rspassimpt-${tag}-${target}.tar.gz"
+          bin="target/${target}/release/rspassimpt"
+
+          # Best-effort strip — only meaningful on Linux GNU; macOS already
+          # strips via release profile config.
+          if [[ "$target" == *linux* ]]; then
+            strip "$bin" || true
+          fi
+
+          tar -czf "$archive" -C "target/${target}/release" rspassimpt
+          shasum -a 256 "$archive" | tee "${archive}.sha256"
+
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. Collect artifacts, compute SHAs, publish a GitHub Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.collect.outputs.version }}
+      sha_aarch64_darwin: ${{ steps.collect.outputs.sha_aarch64_darwin }}
+      sha_x86_64_darwin: ${{ steps.collect.outputs.sha_x86_64_darwin }}
+      sha_x86_64_linux: ${{ steps.collect.outputs.sha_x86_64_linux }}
+      sha_aarch64_linux: ${{ steps.collect.outputs.sha_aarch64_linux }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: collect SHAs
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          declare -A out_keys=(
+            [aarch64-apple-darwin]=sha_aarch64_darwin
+            [x86_64-apple-darwin]=sha_x86_64_darwin
+            [x86_64-unknown-linux-gnu]=sha_x86_64_linux
+            [aarch64-unknown-linux-gnu]=sha_aarch64_linux
+          )
+
+          for target in "${!out_keys[@]}"; do
+            file="dist/rspassimpt-${tag}-${target}.tar.gz"
+            sha=$(shasum -a 256 "$file" | awk '{print $1}')
+            echo "${out_keys[$target]}=$sha" >> "$GITHUB_OUTPUT"
+            echo "$target $sha"
+          done
+
+      - name: create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          draft: false
+          # any tag like v1.2.3-rc1 is auto-marked as pre-release
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Update jtprogru/homebrew-tap with the new Formula/rspassimpt.rb.
+  # ---------------------------------------------------------------------------
+  homebrew:
+    name: homebrew tap
+    needs: release
+    # Don't push to the tap for pre-release tags — they shouldn't ship to users.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: jtprogru/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: render Formula/rspassimpt.rb
+        env:
+          VERSION:            ${{ needs.release.outputs.version }}
+          SHA_AARCH64_DARWIN: ${{ needs.release.outputs.sha_aarch64_darwin }}
+          SHA_X86_64_DARWIN:  ${{ needs.release.outputs.sha_x86_64_darwin }}
+          SHA_X86_64_LINUX:   ${{ needs.release.outputs.sha_x86_64_linux }}
+          SHA_AARCH64_LINUX:  ${{ needs.release.outputs.sha_aarch64_linux }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/rspassimpt.rb <<EOF
+          # typed: false
+          # frozen_string_literal: true
+
+          # This file is generated by .github/workflows/release.yml in
+          # jtprogru/rspassimpt. Do not edit by hand.
+          class Rspassimpt < Formula
+            desc "Import passwords from a macOS Passwords CSV export into pass"
+            homepage "https://github.com/jtprogru/rspassimpt"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/jtprogru/rspassimpt/releases/download/v${VERSION}/rspassimpt-v${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_AARCH64_DARWIN}"
+              else
+                url "https://github.com/jtprogru/rspassimpt/releases/download/v${VERSION}/rspassimpt-v${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_64_DARWIN}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/jtprogru/rspassimpt/releases/download/v${VERSION}/rspassimpt-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_AARCH64_LINUX}"
+              else
+                url "https://github.com/jtprogru/rspassimpt/releases/download/v${VERSION}/rspassimpt-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_X86_64_LINUX}"
+              end
+            end
+
+            depends_on "gnupg"
+            depends_on "pass"
+
+            def install
+              bin.install "rspassimpt"
+            end
+
+            test do
+              system "#{bin}/rspassimpt", "--version"
+            end
+          end
+          EOF
+
+      - name: commit & push
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/rspassimpt.rb
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "rspassimpt ${VERSION}"
+          git push
