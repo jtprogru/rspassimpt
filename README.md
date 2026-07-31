@@ -115,13 +115,15 @@ CSV pipeline throughput on an Apple Silicon laptop (release build, Criterion):
 
 End-to-end `--dry-run` on synthetic fixtures:
 
-| Rows      | Wall time |
-|-----------|----------:|
-| 1 000     | < 0.01 s  |
-| 100 000   |   0.36 s  |
-| 1 000 000 |   3.43 s  |
+| Rows      | Wall time | Peak RSS |
+|-----------|----------:|---------:|
+| 1 000     |   0.01 s  |    ~3 MB |
+| 100 000   |   0.37 s  |   ~19 MB |
+| 1 000 000 |   4.0 s   |  ~195 MB |
 
-A real import is bound by `gpg` subprocess throughput rather than by the pipeline; parallelism scales with `--jobs` (defaults to your CPU count).
+Memory in `--dry-run` grows with the row count because the run remembers every entry path it has emitted, which is how it predicts the same skip count as the real import. A real import keeps a flat ~4 MB regardless of file size — it detects collisions at rename time instead. Dropping the dry-run bookkeeping would put the 1M figure back at ~3.4 s and ~4 MB; the exact duplicate report is considered worth the difference at a scale no real password export reaches.
+
+A real import is bound by `gpg` subprocess throughput rather than by the pipeline; parallelism scales with `--jobs` (defaults to your CPU count). Note that concurrent `gpg` processes contend for the keyring lock, so throughput does not scale linearly with `--jobs`.
 
 ## Development
 
