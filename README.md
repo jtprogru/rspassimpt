@@ -56,7 +56,7 @@ rspassimpt passwords.csv
 # Place imported entries under a sub-directory in the store.
 rspassimpt passwords.csv --prefix imported/macos
 
-# Skip entries that already exist (instead of erroring).
+# Don't warn about entries that already exist (they are skipped either way).
 rspassimpt passwords.csv --skip-existing
 
 # Overwrite existing entries.
@@ -85,13 +85,21 @@ notes: |
   <multi-line Notes>
 ```
 
-Empty fields are omitted. Multi-line `Notes` are correctly preserved through CSV escaping.
+Empty fields are omitted. The password is stored byte-for-byte as it appears in the CSV, including any leading or trailing whitespace. Any field that spans several lines — `Notes` most often, but `Username`, `URL` and `OTPAuth` too — is written as an indented block under `key: |`, so a newline inside a CSV field can never forge an extra top-level `key:` line.
+
+A password that itself contains a line break cannot be represented in this format at all: `pass` treats only the first line as the password. Such a row is reported as an error and left unwritten rather than silently truncated — fix the password in the CSV and re-run.
+
+### Duplicate titles
+
+macOS exports routinely contain several rows with the same `Title` (two accounts on one site). They all map to the same entry path, so only one of them can win. The first row to reach the store wins and every other one is reported as skipped; under `--force` the last writer wins instead. Which row wins among duplicates is not deterministic when importing in parallel — use `--dry-run` first to see exactly how many rows will be skipped, or `-j 1` if you need CSV order to decide.
 
 ## Security notes
 
 - `gpg --encrypt -r <id>` uses only the recipient public key. No passphrase is required for the import itself; the secret key only comes into play later when *reading* an entry via `pass show`.
+- `gpg` is invoked with `--no-encrypt-to` and `--compress-algo=none`, matching what `pass` itself does: a stray `encrypt-to` in your `gpg.conf` cannot quietly add a recipient to every imported entry, and the ciphertext size does not leak information about the plaintext.
+- `--no-auto-key-locate` and `--disable-dirmngr` keep `gpg` from reaching out to the network for an unknown recipient key. This matters because the import runs under `--trust-model always` (so a bulk import doesn't stall on trust prompts for legitimate co-recipient keys); without those two flags, a typo in `.gpg-id` could otherwise encrypt your secrets to whatever key a WKD server returned, with the trust check disabled.
 - Paths are sanitised: `..` components and absolute paths in `Title` are rejected before the encryption step, so a hostile CSV cannot write `.gpg` files outside the store.
-- The encrypted blob is written via a temp file in the same directory, fsynced, chmodded to `0600`, then renamed onto the final path — readers never observe a half-written file.
+- The encrypted blob is written via a temp file in the same directory, fsynced, chmodded to `0600`, then renamed onto the final path — readers never observe a half-written file. Without `--force` the rename is a no-clobber link, so an existing entry cannot be destroyed even if two rows race for the same path.
 - This tool does not auto-commit to the pass git repository. Run `git add . && git commit` (or `pass git ...`) yourself after an import — that way you stay in control of the audit log.
 
 ## Performance
@@ -122,7 +130,7 @@ The included `Makefile` wraps the common loops:
 ```bash
 make help          # list all targets
 make build         # debug build (all targets)
-make test          # 8 unit tests
+make test          # 12 unit tests
 make fmt           # cargo fmt
 make lint          # clippy with -D warnings
 make gen-1k        # synthesise tests/fixtures/passwd_1k.csv (1,000 rows)

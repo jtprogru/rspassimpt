@@ -103,8 +103,14 @@ pub fn help_dry_run() -> &'static str {
 
 pub fn help_skip_existing() -> &'static str {
     match lang() {
-        Lang::Ru => "Тихо пропускать уже существующие entry (вместо ошибки)",
-        Lang::En => "Silently skip already-existing entries (instead of erroring)",
+        Lang::Ru => {
+            "Не печатать предупреждение о пропущенных существующих entry \
+             (они пропускаются и без этого флага)"
+        }
+        Lang::En => {
+            "Don't warn about skipped pre-existing entries \
+             (they are skipped with or without this flag)"
+        }
     }
 }
 
@@ -351,6 +357,36 @@ pub fn skip_exists(path: &Path) -> String {
         Lang::En => format!(
             "skip (already exists): {} — re-run with --force or --skip-existing",
             path.display()
+        ),
+    }
+}
+
+pub fn skip_duplicate_title(lineno: usize, path: &Path) -> String {
+    match lang() {
+        Lang::Ru => format!(
+            "skip (дубль Title, строка {lineno}): {} уже занят более ранней строкой \
+             — запустите с --force, чтобы победила последняя",
+            path.display()
+        ),
+        Lang::En => format!(
+            "skip (duplicate Title, line {lineno}): {} was already claimed by an earlier row \
+             — re-run with --force to let the last one win",
+            path.display()
+        ),
+    }
+}
+
+pub fn err_password_line_break(lineno: usize, title: &str) -> String {
+    match lang() {
+        Lang::Ru => format!(
+            "error: строка {lineno} ({title}): пароль содержит перенос строки и не может быть \
+             сохранён без потерь — формат pass считает паролем только первую строку. \
+             Запись пропущена; исправьте пароль в CSV и повторите импорт"
+        ),
+        Lang::En => format!(
+            "error: line {lineno} ({title}): the password contains a line break and cannot be \
+             stored losslessly — the pass format treats only the first line as the password. \
+             Entry not written; fix the password in the CSV and re-run"
         ),
     }
 }
