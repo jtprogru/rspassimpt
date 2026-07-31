@@ -1,15 +1,16 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::cli::Cli;
-use crate::gpg;
+use crate::gpg::{self, Written};
 use crate::i18n;
-use crate::sanitize::{RawRow, build_entry, sanitize_path};
+use crate::sanitize::{RawRow, build_entry, password_has_line_break, sanitize_path};
 use crate::store::{RecipientCache, build_entry_path, resolve_store_dir};
 
 const REQUIRED_COLUMNS: &[&str] = &["Title", "Password"];
@@ -56,10 +57,20 @@ pub fn run(args: Cli) -> Result<u8> {
     let pb = make_progress(args.no_progress);
 
     let counters = Counters::default();
-    let force = args.force;
     let dry_run = args.dry_run;
-    let skip_existing = args.skip_existing;
-    let store_dir_ref: &Path = &store_dir;
+
+    let ctx = Ctx {
+        prefix: &prefix,
+        store_dir: &store_dir,
+        recipients: &recipients,
+        force: args.force,
+        dry_run,
+        skip_existing: args.skip_existing,
+        // A real run detects collisions atomically at rename time, which costs
+        // nothing on the hot path. dry-run has no rename to lean on, so it
+        // tracks the paths it has emitted in order to predict the same result.
+        seen: dry_run.then(|| Mutex::new(HashSet::new())),
+    };
 
     let handle_outcome = |outcome: Outcome| {
         match outcome {
@@ -73,16 +84,7 @@ pub fn run(args: Cli) -> Result<u8> {
     // dry-run does no I/O, so parallelism buys nothing and only garbles stdout.
     if dry_run {
         for (idx, parse_res) in reader.deserialize::<RawRow>().enumerate() {
-            handle_outcome(process_row(
-                parse_res,
-                idx + 2,
-                &prefix,
-                store_dir_ref,
-                &recipients,
-                force,
-                true,
-                skip_existing,
-            ));
+            handle_outcome(process_row(parse_res, idx + 2, &ctx));
         }
     } else {
         reader
@@ -91,16 +93,7 @@ pub fn run(args: Cli) -> Result<u8> {
             .par_bridge()
             .for_each(|(idx, parse_res)| {
                 let lineno = idx + 2; // line 1 is the header
-                handle_outcome(process_row(
-                    parse_res,
-                    lineno,
-                    &prefix,
-                    store_dir_ref,
-                    &recipients,
-                    force,
-                    false,
-                    skip_existing,
-                ));
+                handle_outcome(process_row(parse_res, lineno, &ctx));
             });
     }
 
@@ -127,17 +120,29 @@ enum Outcome {
     Failed,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_row(
-    parse_res: csv::Result<RawRow>,
-    lineno: usize,
-    prefix: &str,
-    store_dir: &Path,
-    recipients: &RecipientCache,
+/// Everything a row needs, shared across rayon workers.
+struct Ctx<'a> {
+    prefix: &'a str,
+    store_dir: &'a Path,
+    recipients: &'a RecipientCache,
     force: bool,
     dry_run: bool,
     skip_existing: bool,
-) -> Outcome {
+    /// Entry paths already emitted. Only populated for dry-run — see `run`.
+    seen: Option<Mutex<HashSet<PathBuf>>>,
+}
+
+impl Ctx<'_> {
+    /// Record `path` and report whether an earlier row already claimed it.
+    fn is_duplicate(&self, path: &Path) -> bool {
+        match &self.seen {
+            Some(seen) => !seen.lock().unwrap().insert(path.to_path_buf()),
+            None => false,
+        }
+    }
+}
+
+fn process_row(parse_res: csv::Result<RawRow>, lineno: usize, ctx: &Ctx<'_>) -> Outcome {
     let mut row = match parse_res {
         Ok(r) => r,
         Err(e) => {
@@ -156,8 +161,15 @@ fn process_row(
         row.zeroize_in_place();
         return Outcome::Skipped;
     }
+    // The store format cannot round-trip such a password, and writing it
+    // anyway would truncate the secret at the first newline without a word.
+    if password_has_line_break(&row.password) {
+        eprintln!("{}", i18n::err_password_line_break(lineno, &title));
+        row.zeroize_in_place();
+        return Outcome::Failed;
+    }
 
-    let out_path = match build_entry_path(store_dir, prefix, &title) {
+    let out_path = match build_entry_path(ctx.store_dir, ctx.prefix, &title) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}", i18n::row_error(lineno, &title, &e));
@@ -166,9 +178,15 @@ fn process_row(
         }
     };
 
-    if dry_run {
+    if ctx.dry_run {
+        // Mirror what the real run would do with a colliding title.
+        if ctx.is_duplicate(&out_path) && !ctx.force {
+            eprintln!("{}", i18n::skip_duplicate_title(lineno, &out_path));
+            row.zeroize_in_place();
+            return Outcome::Skipped;
+        }
         let plaintext = build_entry(&row);
-        let pw_len = row.password.trim().len();
+        let pw_len = row.password.len();
         let body = String::from_utf8_lossy(&plaintext);
         let mut lines = body.lines();
         let _ = lines.next();
@@ -183,8 +201,10 @@ fn process_row(
         return Outcome::Imported;
     }
 
-    if !force && out_path.exists() {
-        if !skip_existing {
+    // Cheap pre-check that saves spawning gpg for entries that already exist.
+    // It is *not* what makes overwriting safe — the no-clobber rename below is.
+    if !ctx.force && out_path.exists() {
+        if !ctx.skip_existing {
             eprintln!("{}", i18n::skip_exists(&out_path));
         }
         row.zeroize_in_place();
@@ -192,7 +212,7 @@ fn process_row(
     }
 
     let parent = out_path.parent().expect("entry has a parent directory");
-    let recps = match recipients.recipients_for(parent) {
+    let recps = match ctx.recipients.recipients_for(parent) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", i18n::row_error(lineno, &title, &e));
@@ -202,13 +222,21 @@ fn process_row(
     };
 
     let plaintext = build_entry(&row);
-    let res = gpg::encrypt_to_file(&recps, &plaintext, &out_path);
+    let res = gpg::encrypt_to_file(&recps, &plaintext, &out_path, ctx.force);
     // plaintext is wiped by Zeroizing's drop impl.
     drop(plaintext);
     row.zeroize_in_place();
 
     match res {
-        Ok(()) => Outcome::Imported,
+        Ok(Written::Ok) => Outcome::Imported,
+        // Another row won the race for this path between the check above and
+        // the rename. Report it like any other pre-existing entry.
+        Ok(Written::AlreadyExists) => {
+            if !ctx.skip_existing {
+                eprintln!("{}", i18n::skip_exists(&out_path));
+            }
+            Outcome::Skipped
+        }
         Err(e) => {
             eprintln!("{}", i18n::row_error(lineno, &title, &e));
             Outcome::Failed
