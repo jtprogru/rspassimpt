@@ -183,8 +183,10 @@ jobs:
           class Rspassimpt < Formula
             desc "Import passwords from a macOS Passwords CSV export into pass"
             homepage "https://github.com/jtprogru/rspassimpt"
-            version "${VERSION}"
             license "MIT"
+
+            depends_on "gnupg"
+            depends_on "pass"
 
             on_macos do
               if Hardware::CPU.arm?
@@ -205,9 +207,6 @@ jobs:
                 sha256 "${SHA_X86_64_LINUX}"
               end
             end
-
-            depends_on "gnupg"
-            depends_on "pass"
 
             def install
               bin.install "rspassimpt"
