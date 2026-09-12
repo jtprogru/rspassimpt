@@ -23,7 +23,7 @@ rayon = "1"
 anyhow = "1"
 zeroize = { version = "1", features = ["alloc", "derive"] }
 tempfile = "3"
-dirs = "6"
+dirs = "7"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
